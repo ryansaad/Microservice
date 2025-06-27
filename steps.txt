@@ -1,0 +1,267 @@
+---
+
+## Setup and Installation
+
+Follow these steps to set up the AWS infrastructure, Jenkins CI/CD environment, and deploy the microservices application.
+
+### 1. AWS Account Setup
+
+* **Region Selection:** Choose an AWS region closest to you.
+* **Security Group Configuration:** Open necessary inbound ports (e.g., SSH, Jenkins (8080), HTTP/HTTPS (80/443)) in your default or a new security group.
+* **IAM User for EKS:**
+    * Create an IAM user (e.g., `eks-user`).
+    * Attach required policies. *Refer to the `infra-setup` branch for the exact list of policies and an inline JSON policy to attach.*
+    * Generate and securely store the **Access Key ID** and **Secret Access Key** for this user.
+
+### 2. EC2 Instance (Jenkins Server) Setup
+
+* **Launch EC2 Instance:**
+    * Launch an **Ubuntu Server 20.04 LTS** EC2 instance (e.g., `t3.medium` or `t3.large` for sufficient resources).
+    * Select or create a new **Key Pair** (`.pem` file) for SSH access.
+    * Assign the security group configured in Step 1.
+* **Connect to EC2:** Connect to your EC2 instance via SSH using your key pair (e.g., using MobaXterm).
+    ```bash
+    ssh -i your-key-pair.pem ubuntu@<your-ec2-public-ip>
+    ```
+* **Update Packages:**
+    ```bash
+    sudo apt update
+    ```
+
+### 3. Install CLIs (AWS, kubectl, eksctl)
+
+* **Download and Execute Installation Script:**
+    * *Commands for installing AWS CLI, `kubectl`, and `eksctl` are provided in a script within the `infra-setup` branch.*
+    * You can create a script file (e.g., `install_clis.sh`) on your EC2 instance and run it.
+    ```bash
+    mkdir scripts && cd scripts
+    # Copy/paste the commands from infra-setup into install_clis.sh
+    vi install_clis.sh
+    chmod +x install_clis.sh
+    ./install_clis.sh
+    ```
+* **Configure AWS CLI:**
+    ```bash
+    aws configure
+    # Enter your AWS Access Key ID, Secret Access Key, and default region (e.g., ap-south-1)
+    ```
+
+### 4. Jenkins and Docker Setup on EC2
+
+* **Install Java JDK 17:**
+    * Jenkins requires Java. Install OpenJDK 17.
+    ```bash
+    sudo apt install openjdk-17-jdk -y
+    ```
+* **Install Jenkins:**
+    * *Refer to the official Jenkins documentation for Ubuntu installation steps, or use a provided script from your `infra-setup` branch (e.g., `jenkins.sh`).*
+    * Typically involves adding the Jenkins repository key, repository, and then installing.
+    ```bash
+    # Example commands (verify with official Jenkins docs or your infra-setup script)
+    sudo wget -O /usr/share/keyrings/jenkins-keyring.asc \
+      [https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key](https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key)
+    echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
+      [https://pkg.jenkins.io/debian-stable](https://pkg.jenkins.io/debian-stable) binary/ | sudo tee \
+      /etc/apt/sources.list.d/jenkins.list > /dev/null
+    sudo apt-get update
+    sudo apt-get install jenkins -y
+    ```
+    * Jenkins will be accessible on `http://<Your-EC2-Public-IP>:8080`.
+    * Retrieve the initial admin password from `/var/lib/jenkins/secrets/initialAdminPassword` on the EC2 instance.
+    * Complete the Jenkins setup by installing **suggested plugins** and creating the **first admin user**.
+* **Install Docker:**
+    ```bash
+    sudo apt install docker.io -y
+    sudo usermod -aG docker ubuntu # Add ubuntu user to docker group
+    sudo chmod 666 /var/run/docker.sock # Grant permission for Docker socket
+    sudo systemctl enable docker
+    sudo systemctl start docker
+    ```
+
+### 5. Create EKS Cluster
+
+* **Run `eksctl` Command:**
+    * Use the `eksctl` command provided in your `infra-setup` branch to create the EKS cluster.
+    * **Crucially, verify the cluster name, region, and availability zones** match your preferences. The transcript example used `eks-1` for the cluster name.
+    ```bash
+    # Example command (adjust cluster name, region, zones, and key pair name)
+    eksctl create cluster \
+        --name eks-1 \
+        --version 1.29 \
+        --region ap-south-1 \
+        --zones ap-south-1a,ap-south-1b \
+        --without-nodegroup
+    ```
+* **Set up IAM OIDC Provider:**
+    ```bash
+    # Command from infra-setup branch
+    eksctl utils associate-iam-oidc-provider --cluster eks-1 --approve --region ap-south-1
+    ```
+* **Create Node Group (with Autoscaling):**
+    * Create the worker node group for your EKS cluster.
+    * **Ensure your Key Pair name matches** the one used for your EC2 instance.
+    ```bash
+    # Example command (adjust cluster name, region, node type, key pair name)
+    eksctl create nodegroup \
+        --cluster eks-1 \
+        --region ap-south-1 \
+        --name worker-nodes \
+        --node-type t3.medium \
+        --nodes 3 \
+        --nodes-min 2 \
+        --nodes-max 4 \
+        --node-volume-size 20 \
+        --ssh-access --ssh-public-key <YOUR_KEY_PAIR_NAME>
+    ```
+
+### 6. Kubernetes RBAC and Service Account Setup
+
+These steps are critical for secure deployments from Jenkins to your EKS cluster.
+
+* **Create Namespace:**
+    ```bash
+    kubectl create namespace web-apps
+    ```
+* **Create Service Account:**
+    * Create a file `svc.yaml` and paste the Service Account definition (from `infra-setup`).
+    ```bash
+    # Content for svc.yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: jenkins
+      namespace: web-apps
+    ```
+    ```bash
+    kubectl apply -f svc.yaml
+    ```
+* **Create Role:**
+    * Create a file `role.yaml` and paste the Role definition (from `infra-setup`).
+    ```bash
+    # Content for role.yaml (example, ensure it matches your infra-setup branch)
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: jenkins-role
+      namespace: web-apps
+    rules:
+    - apiGroups: ["", "apps", "extensions"]
+      resources: ["deployments", "services", "pods", "replicasets"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    ```
+    ```bash
+    kubectl apply -f role.yaml
+    ```
+* **Create Role Binding:**
+    * Create a file `bind.yaml` and paste the Role Binding definition (from `infra-setup`).
+    ```bash
+    # Content for bind.yaml (example, ensure it matches your infra-setup branch)
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: jenkins-rolebinding
+      namespace: web-apps
+    subjects:
+    - kind: ServiceAccount
+      name: jenkins
+      namespace: web-apps
+    roleRef:
+      kind: Role
+      name: jenkins-role
+      apiGroup: rbac.authorization.k8s.io
+    ```
+    ```bash
+    kubectl apply -f bind.yaml
+    ```
+* **Generate Service Account Token Secret:**
+    * Create a file `sec.yaml` and paste the Secret definition (from Kubernetes official docs or your `infra-setup` branch, ensure `serviceAccountName` is `jenkins`).
+    ```bash
+    # Content for sec.yaml
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: jenkins-sa-token
+      annotations:
+        kubernetes.io/service-account.name: jenkins
+    type: kubernetes.io/service-account-token
+    ```
+    ```bash
+    kubectl apply -f sec.yaml -n web-apps
+    ```
+* **Retrieve Service Account Token:**
+    ```bash
+    kubectl describe secret jenkins-sa-token -n web-apps
+    # Copy the 'token' value from the output. This will be used in Jenkins.
+    ```
+
+### 7. Jenkins Plugin Installation and Credential Configuration
+
+* **Install Plugins:**
+    * In Jenkins, go to **Manage Jenkins > Plugins > Available plugins**.
+    * Install the following:
+        * **Docker**
+        * **Docker Pipeline**
+        * **Kubernetes**
+        * **Kubernetes CLI**
+        * **Multibranch Scan Webhook Trigger**
+* **Configure Docker Tool:**
+    * Go to **Manage Jenkins > Tools**.
+    * Scroll to **Docker installations**.
+    * Click **Add Docker**.
+    * Set **Name** to `docker`.
+    * Select **Install automatically**.
+    * Choose `Install from docker.com`.
+    * Click **Save**.
+* **Add Docker Hub Credentials:**
+    * Go to **Manage Jenkins > Credentials > System > Global credentials (unrestricted)**.
+    * Click **Add Credentials**.
+    * **Kind:** `Username with password`
+    * **Username:** Your Docker Hub username
+    * **Password:** Your Docker Hub password
+    * **ID:** `docker-creds` (Crucial: This ID is referenced in your `Jenkinsfile`s)
+    * Click **Create**.
+* **Add GitHub Credentials:**
+    * Go to **Manage Jenkins > Credentials > System > Global credentials (unrestricted)**.
+    * Click **Add Credentials**.
+    * **Kind:** `Username with password`
+    * **Username:** Your GitHub username
+    * **Password:** Your GitHub Personal Access Token (PAT)
+    * **ID:** `git-cred`
+    * Click **Create**.
+* **Add Kubernetes Token Credentials:**
+    * Go to **Manage Jenkins > Credentials > System > Global credentials (unrestricted)**.
+    * Click **Add Credentials**.
+    * **Kind:** `Secret text`
+    * **Secret:** The service account token you retrieved in Step 6.
+    * **ID:** `K8-token`
+    * Click **Create**.
+
+### 8. Configure Jenkins Multibranch Pipeline
+
+* **Create New Item:**
+    * In Jenkins dashboard, click **New Item**.
+    * **Item name:** `microservice-e-commerce` (or your preferred project name)
+    * Select **Multibranch Pipeline**.
+    * Click **OK**.
+* **Configure Source:**
+    * Under **Branch Sources**, click **Add source** > **Git**.
+    * **Project Repository:** Paste your GitHub repository URL.
+    * **Credentials:** Select `git-cred`.
+    * **Script Path:** Ensure this is set to `Jenkinsfile` (default).
+* **Configure Webhook Trigger:**
+    * Enable **Scan by webhook trigger**.
+    * **Trigger Token:** Enter a unique token (e.g., `Aditya`).
+    * **Copy the generated Webhook URL.** This will look something like `http://<Your-EC2-Public-IP>:8080/multibranch-webhook-trigger/invoke?token=Aditya`. Save this URL.
+* Click **Apply** and then **Save**.
+
+### 9. Configure GitHub Webhook
+
+* **Go to your GitHub Repository:** Navigate to `Settings > Webhooks`.
+* **Add Webhook:** Click **Add webhook**.
+* **Payload URL:** Paste the Webhook URL copied from Jenkins in Step 8.
+* **Content type:** Select `application/json`.
+* **Which events would you like to trigger this webhook?** Select **"Just the push event."**
+* Click **Add webhook**.
+* Verify the webhook shows "Last delivery was successful."
+
+---
